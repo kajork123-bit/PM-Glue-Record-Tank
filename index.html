@@ -147,6 +147,8 @@ body{
   backdrop-filter:blur(4px);
 }
 .theme-toggle:hover{border-color:rgba(0,212,255,0.4);background:rgba(0,212,255,0.08)}
+.theme-toggle.spin{animation:gl-refresh-spin 0.8s linear infinite}
+@keyframes gl-refresh-spin{to{transform:rotate(360deg)}}
 
 /* NAV */
 .nav{
@@ -658,6 +660,7 @@ textarea{resize:vertical;min-height:70px}
   </div>
   <div class="header-right">
     <div class="live-clock" id="clock"></div>
+    <button class="theme-toggle" onclick="refreshFromSheet()" id="refreshBtn" title="รีเฟรชข้อมูลจาก Google Sheet">🔄</button>
     <div class="alert-badge" id="alertBadge" onclick="showPage('dashboard')">⚠ PM ครบกำหนด!</div>
     <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn" title="เปลี่ยน Theme">🌙</button>
   </div>
@@ -1204,7 +1207,7 @@ let isSaving = false;
 // ============================
 // GOOGLE SHEET (SOURCE OF TRUTH)
 // ============================
-const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzU-A3twd_f2t6h6LnRx36E_U8NKI96hO_t9EXWu_rievtFyoPpzw3uEoCx5sk-NAM_/exec';
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxTbFdXKWXs2dQt8QZ0chJxGyiUzlV5BXbE4RkhR3_9I9dusSwY5TxFq-Txk40jKcn1/exec';
 
 // แสดง/ซ่อน spinner เต็มหน้าจอ
 function showLoading(msg) {
@@ -1265,12 +1268,18 @@ async function loadData() {
     pmData = (data.pmData || []).map(r => ({
       ...r,
       id: Number(r.id),
+      date: normalizeSheetDate(r.date),
       doneCount: Number(r.doneCount),
       totalCount: Number(r.totalCount)
     })).sort((a,b)=> a.date < b.date ? 1 : -1);
 
-    glueData = (data.glueData || []).map(g => ({...g, id: Number(g.id)}))
-      .sort((a,b)=> a.date < b.date ? 1 : -1);
+    glueData = (data.glueData || []).map(g => ({
+      ...g,
+      id: Number(g.id),
+      date: normalizeSheetDate(g.date),
+      time: normalizeSheetTime(g.time),
+      expiry: normalizeSheetDate(g.expiry)
+    })).sort((a,b)=> a.date < b.date ? 1 : -1);
 
   } catch(err) {
     console.error('โหลดข้อมูลจาก Google Sheet ไม่สำเร็จ:', err);
@@ -1285,6 +1294,42 @@ function saveSettings() {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
 }
 
+
+// Normalize date values coming back from Google Sheet (Sheets often serializes
+// Date cells as full UTC ISO timestamps, e.g. "2026-06-10T17:00:00.000Z" for a
+// 2026-06-11 cell in Asia/Bangkok). Shift to Bangkok time before extracting Y-M-D
+// so the displayed date matches the date shown in the Sheet.
+function normalizeSheetDate(v){
+  if(!v) return '';
+  const s = String(v);
+  if(/^\d{4}-\d{2}-\d{2}$/.test(s)) return s; // already plain YYYY-MM-DD
+  const m = s.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+  if(m){
+    const d = new Date(s);
+    if(isNaN(d.getTime())) return s.slice(0,10);
+    const bkk = new Date(d.getTime() + 7*60*60*1000); // Asia/Bangkok (UTC+7)
+    return `${bkk.getUTCFullYear()}-${String(bkk.getUTCMonth()+1).padStart(2,'0')}-${String(bkk.getUTCDate()).padStart(2,'0')}`;
+  }
+  return s.slice(0,10);
+}
+
+// Normalize time values from Google Sheet. A Sheets "time only" cell is
+// serialized as a full ISO timestamp on the epoch date 1899-12-30, e.g.
+// "1899-12-30T09:17:56.000Z" for a 16:17 entry (UTC -> +7h Bangkok).
+// Convert that (or any HH:MM[:SS] / full ISO) into a plain "HH:MM" string.
+function normalizeSheetTime(v){
+  if(!v) return '';
+  const s = String(v);
+  if(/^\d{1,2}:\d{2}$/.test(s)) return s; // already HH:MM
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/);
+  if(m){
+    const d = new Date(s);
+    if(isNaN(d.getTime())) return s;
+    const bkk = new Date(d.getTime() + 7*60*60*1000); // Asia/Bangkok (UTC+7)
+    return `${String(bkk.getUTCHours()).padStart(2,'0')}:${String(bkk.getUTCMinutes()).padStart(2,'0')}`;
+  }
+  return s;
+}
 
 // Helpers: parse local YYYY-MM-DD to Date (avoid UTC offset), ISO local date, escapers
 function parseDateLocal(s){ if(!s) return null; const [y,m,d]=String(s).split('-').map(Number); return new Date(y,m-1,d); }
@@ -1419,6 +1464,26 @@ function checkAlerts() {
 // NAVIGATION
 // ============================
 const PAGES=['dashboard','new-pm','glue-tank','history','calendar','monthly','analytics','settings'];
+
+/**
+ * โหลดข้อมูลล่าสุดจาก Google Sheet แล้ว re-render หน้าปัจจุบัน
+ */
+async function refreshFromSheet() {
+  const btn = document.getElementById('refreshBtn');
+  if(btn) btn.classList.add('spin');
+  await loadData();
+  checkAlerts();
+  const activePage = document.querySelector('.page.active');
+  const id = activePage ? activePage.id.replace('page-','') : 'dashboard';
+  if(id==='dashboard'){renderDashboard();renderTrendChart();}
+  if(id==='glue-tank') renderGlueTankPage();
+  if(id==='history') renderHistory();
+  if(id==='calendar') renderCalendar();
+  if(id==='monthly') renderMonthly();
+  if(id==='analytics'){renderIssueAnalytics();renderMonthlyChart();renderShiftChart();}
+  if(btn) btn.classList.remove('spin');
+  toast('รีเฟรชข้อมูลล่าสุดแล้ว 🔄', 'success');
+}
 async function showPage(id){
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
@@ -1427,10 +1492,8 @@ async function showPage(id){
   const idx=PAGES.indexOf(id);
   if(idx>=0) document.querySelectorAll('.nav-btn')[idx].classList.add('active');
 
-  // โหลดข้อมูลล่าสุดจาก Google Sheet ก่อนแสดงผล (ยกเว้นหน้าฟอร์มกรอกข้อมูล)
-  if(id !== 'new-pm') {
-    await loadData();
-  }
+  // ใช้ข้อมูลที่โหลดไว้ในเครื่อง (cache) — ไม่โหลดจาก Sheet ใหม่ทุกครั้งเพื่อความเร็ว
+  // กดปุ่ม "🔄 รีเฟรชข้อมูล" ที่ header เพื่อดึงข้อมูลล่าสุดจาก Sheet
 
   if(id==='dashboard'){renderDashboard();renderTrendChart();}
   if(id==='glue-tank') renderGlueTankPage();
